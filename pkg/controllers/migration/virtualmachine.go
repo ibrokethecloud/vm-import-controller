@@ -80,40 +80,39 @@ func RegisterVMImportController(ctx context.Context, vmware migrationController.
 	}
 
 	relatedresource.Watch(ctx, "virtualmachineimage-change", vmHandler.ReconcileVMI, importVM, vmi)
-	importVM.OnChange(ctx, "virtualmachine-import-job-change", vmHandler.OnVirtualMachineChange)
+	importVM.OnChange(ctx, "virtualmachine-import-job-preflight-checks", vmHandler.preFlightChecksHandlers)
+	importVM.OnChange(ctx, "virtualmachine-import-job-trigger-exports", vmHandler.triggerExportHandler)
+	importVM.OnChange(ctx, "virtualmachine-import-job-create-virtualmachineimages", vmHandler.createVirtualMachineImageHandler)
+	importVM.OnChange(ctx, "virtualmachine-import-job-reconcile-virtualmachineimages", vmHandler.reconcileVirtualMachineImageHandler)
+	importVM.OnChange(ctx, "virtualmachine-import-job-clean-and-resubmit-images", vmHandler.cleanupAndResubmitHandler)
+	importVM.OnChange(ctx, "virtualmachine-import-job-create-virtualmachine", vmHandler.createVirtualMachineHandler)
+	importVM.OnChange(ctx, "virtualmachine-import-job-check-virtualmachine", vmHandler.checkVirtualMachineHandler)
 }
 
-func (h *virtualMachineHandler) OnVirtualMachineChange(key string, vmObj *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+func (h *virtualMachineHandler) preFlightChecksHandlers(key string, vmObj *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
 
 	if vmObj == nil || vmObj.DeletionTimestamp != nil {
 		return nil, nil
 	}
 
 	vm := vmObj.DeepCopy()
-	switch vm.Status.Status {
-	case "": // run preflight checks and make vm ready for import
-		return h.preFlightWrapper(vm)
-	case migration.SourceReady: //vm migration is valid and ready. trigger migration specific import
-		return h.triggerExportWrapper(vm)
-	case migration.DisksExported: // prepare and add routes for disks to be used for VirtualMachineImage CRD
-		return h.createVirtualMachineImageWrapper(vm)
-	case migration.DiskImagesSubmitted:
-		return h.reconcileVirtualMachineImageWrapper(vm)
-	case migration.DiskImagesFailed:
-		return h.cleanupAndResubmitWrapper(vm)
-	case migration.DiskImagesReady:
-		return h.createVirtualMachineWrapper(vm)
-	case migration.VirtualMachineCreated:
-		return h.checkVirtualMachineRunningWrapper(vm)
-	case migration.VirtualMachineRunning:
-		logrus.Infof("vm %s in namespace %v imported successfully", vm.Name, vm.Namespace)
-		return vm, h.tidyUpObjects(vm)
-	case migration.VirtualMachineInvalid:
-		logrus.Infof("vm %s in namespace %v has an invalid spec", vm.Name, vm.Namespace)
+
+	if vm.Status.Status != "" {
 		return vm, nil
 	}
 
-	return vm, nil
+	err := h.preFlightChecks(vm)
+	if err != nil {
+		if err.Error() == migration.NotValidDNS1123Label {
+			logrus.Errorf("vm migration target %s in VM %s in namespace %s is not RFC 1123 compliant", vm.Spec.VirtualMachineName, vm.Name, vm.Namespace)
+			vm.Status.Status = migration.VirtualMachineInvalid
+			h.importVM.UpdateStatus(vm)
+		} else {
+			return vm, err
+		}
+	}
+	vm.Status.Status = migration.SourceReady
+	return h.importVM.UpdateStatus(vm)
 }
 
 // preFlightChecks is used to validate that the associate sources and VM migration references are valid
@@ -614,7 +613,16 @@ func (h *virtualMachineHandler) preFlightWrapper(vm *migration.VirtualMachineImp
 	return h.importVM.UpdateStatus(vm)
 }
 
-func (h *virtualMachineHandler) triggerExportWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+func (h *virtualMachineHandler) triggerExportHandler(key string, vmObj *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+	if vmObj == nil || vmObj.DeletionTimestamp != nil {
+		return nil, nil
+	}
+
+	vm := vmObj.DeepCopy()
+
+	if vm.Status.Status != migration.SourceReady {
+		return vm, nil
+	}
 	err := h.triggerExport(vm)
 	if err != nil {
 		return vm, err
@@ -625,7 +633,17 @@ func (h *virtualMachineHandler) triggerExportWrapper(vm *migration.VirtualMachin
 	return h.importVM.UpdateStatus(vm)
 }
 
-func (h *virtualMachineHandler) createVirtualMachineImageWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+func (h *virtualMachineHandler) createVirtualMachineImageHandler(key string, vmObj *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+	if vmObj == nil || vmObj.DeletionTimestamp != nil {
+		return nil, nil
+	}
+
+	vm := vmObj.DeepCopy()
+
+	if vm.Status.Status != migration.DisksExported {
+		return vm, nil
+	}
+
 	orgStatus := vm.Status.DeepCopy()
 	// If VM has no disks associated ignore the VM
 	if len(orgStatus.DiskImportStatus) == 0 {
@@ -651,8 +669,18 @@ func (h *virtualMachineHandler) createVirtualMachineImageWrapper(vm *migration.V
 	return h.importVM.UpdateStatus(vm)
 }
 
-func (h *virtualMachineHandler) reconcileVirtualMachineImageWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+func (h *virtualMachineHandler) reconcileVirtualMachineImageHandler(key string, vmObj *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
 	// check and update disk image status based on VirtualMachineImage watches
+	if vmObj == nil || vmObj.DeletionTimestamp != nil {
+		return nil, nil
+	}
+
+	vm := vmObj.DeepCopy()
+
+	if vm.Status.Status != migration.DiskImagesSubmitted {
+		return vm, nil
+	}
+
 	err := h.reconcileVMIStatus(vm)
 	if err != nil {
 		return vm, err
@@ -687,8 +715,18 @@ func (h *virtualMachineHandler) reconcileVirtualMachineImageWrapper(vm *migratio
 	return h.importVM.UpdateStatus(vm)
 }
 
-func (h *virtualMachineHandler) cleanupAndResubmitWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+func (h *virtualMachineHandler) cleanupAndResubmitHandler(key string, vmObj *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
 	// re-export VM and trigger re-import again
+	if vmObj == nil || vmObj.DeletionTimestamp != nil {
+		return nil, nil
+	}
+
+	vm := vmObj.DeepCopy()
+
+	if vm.Status.Status != migration.DiskImagesFailed {
+		return vm, nil
+	}
+
 	err := h.cleanupAndResubmit(vm)
 	if err != nil {
 		return vm, err
@@ -697,7 +735,16 @@ func (h *virtualMachineHandler) cleanupAndResubmitWrapper(vm *migration.VirtualM
 	return h.importVM.UpdateStatus(vm)
 }
 
-func (h *virtualMachineHandler) createVirtualMachineWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+func (h *virtualMachineHandler) createVirtualMachineHandler(key string, vmObj *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+	if vmObj == nil || vmObj.DeletionTimestamp != nil {
+		return nil, nil
+	}
+
+	vm := vmObj.DeepCopy()
+
+	if vm.Status.Status != migration.DiskImagesReady {
+		return vm, nil
+	}
 	// create VM to use the VirtualMachineObject
 	err := h.createVirtualMachine(vm)
 	if err != nil {
@@ -721,7 +768,17 @@ func (h *virtualMachineHandler) updateDiskImportStatus(vm *migration.VirtualMach
 	return newVM, fmt.Errorf("error updating virtalmachineimport status: %s/%s : %w, when original disk import failed %w", vm.Name, vm.Namespace, newErr, orgErr)
 }
 
-func (h *virtualMachineHandler) checkVirtualMachineRunningWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+func (h *virtualMachineHandler) checkVirtualMachineHandler(key string, vmObj *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+	if vmObj == nil || vmObj.DeletionTimestamp != nil {
+		return nil, nil
+	}
+
+	vm := vmObj.DeepCopy()
+
+	if vm.Status.Status != migration.VirtualMachineCreated {
+		return vm, nil
+	}
+
 	// wait for VM to be running using a watch on VM's
 	ok, err := h.checkVirtualMachine(vm)
 	if err != nil {
