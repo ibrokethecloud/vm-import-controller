@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/validation"
 	kubevirt "kubevirt.io/api/core/v1"
 
@@ -35,7 +36,8 @@ import (
 )
 
 const (
-	vmiAnnotation = "migaration.harvesterhci.io/virtualmachineimport"
+	vmiAnnotation    = "migaration.harvesterhci.io/virtualmachineimport"
+	imageDisplayName = "harvesterhci.io/imageDisplayName"
 )
 
 type VirtualMachineOperations interface {
@@ -373,26 +375,7 @@ func (h *virtualMachineHandler) createVirtualMachineImages(vm *migration.Virtual
 	status := vm.Status.DeepCopy()
 	for i, d := range status.DiskImportStatus {
 		if !util.ConditionExists(d.DiskConditions, migration.VirtualMachineImageSubmitted, v1.ConditionTrue) {
-			vmi := &harvesterv1beta1.VirtualMachineImage{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "image-",
-					Namespace:    vm.Namespace,
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							APIVersion: vm.APIVersion,
-							Kind:       vm.Kind,
-							UID:        vm.UID,
-							Name:       vm.Name,
-						},
-					},
-				},
-				Spec: harvesterv1beta1.VirtualMachineImageSpec{
-					DisplayName: fmt.Sprintf("vm-import-%s-%s", vm.Name, d.Name),
-					URL:         fmt.Sprintf("http://%s:%d/%s", server.Address(), server.DefaultPort(), d.Name),
-					SourceType:  "download",
-				},
-			}
-			vmiObj, err := h.vmi.Create(vmi)
+			vmiObj, err := h.checkAndCreateVirtualMachineImage(vm, d)
 			if err != nil {
 				return fmt.Errorf("error creating vmi: %v", err)
 			}
@@ -675,4 +658,47 @@ func generateAnnotations(vm *migration.VirtualMachineImport, vmi *harvesterv1bet
 		"harvesterhci.io/imageId":        fmt.Sprintf("%s/%s", vmi.Namespace, vmi.Name),
 	}
 	return annotations, nil
+}
+
+func (h *virtualMachineHandler) checkAndCreateVirtualMachineImage(vm *migration.VirtualMachineImport, d migration.DiskInfo) (*harvesterv1beta1.VirtualMachineImage, error) {
+	imageList, err := h.vmi.Cache().List(vm.Namespace, labels.SelectorFromSet(map[string]string{
+		imageDisplayName: fmt.Sprintf("vm-import-%s-%s", vm.Name, d.Name),
+	}))
+
+	if err != nil {
+		return nil, err
+	}
+
+	if len(imageList) > 1 {
+		return nil, fmt.Errorf("unexpected error: found %d images with label %s=%s, only expected to find one", len(imageList), imageDisplayName, fmt.Sprintf("vm-import-%s-%s", vm.Name, d.Name))
+	}
+
+	if len(imageList) == 1 {
+		return imageList[0], nil
+	}
+
+	// no image found create a new VMI and return object
+	vmi := &harvesterv1beta1.VirtualMachineImage{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "image-",
+			Namespace:    vm.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: vm.APIVersion,
+					Kind:       vm.Kind,
+					UID:        vm.UID,
+					Name:       vm.Name,
+				},
+			},
+			Labels: map[string]string{
+				imageDisplayName: fmt.Sprintf("vm-import-%s-%s", vm.Name, d.Name),
+			},
+		},
+		Spec: harvesterv1beta1.VirtualMachineImageSpec{
+			DisplayName: fmt.Sprintf("vm-import-%s-%s", vm.Name, d.Name),
+			URL:         fmt.Sprintf("http://%s:%d/%s", server.Address(), server.DefaultPort(), d.Name),
+			SourceType:  "download",
+		},
+	}
+	return h.vmi.Create(vmi)
 }
