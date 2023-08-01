@@ -647,17 +647,7 @@ func (h *virtualMachineHandler) createVirtualMachineImageWrapper(vm *migration.V
 
 	err := h.createVirtualMachineImages(vm)
 	if err != nil {
-		// check if any disks have been updated. We need to save this info to eventually reconcile the VMI creation
-		var newVM *migration.VirtualMachineImport
-		var newErr error
-		if !reflect.DeepEqual(orgStatus.DiskImportStatus, vm.Status.DiskImportStatus) {
-			newVM, newErr = h.importVM.UpdateStatus(vm)
-		}
-
-		if newErr != nil {
-			logrus.Errorf("error updating status for vm status %s: %v", vm.Name, newErr)
-		}
-		return newVM, err
+		return h.updateDiskImportStatus(vm, orgStatus, err)
 	}
 
 	ok := true
@@ -725,4 +715,18 @@ func (h *virtualMachineHandler) createVirtualMachineWrapper(vm *migration.Virtua
 	}
 	vm.Status.Status = migration.VirtualMachineCreated
 	return h.importVM.UpdateStatus(vm)
+}
+
+func (h *virtualMachineHandler) updateDiskImportStatus(vm *migration.VirtualMachineImport, orgStatus *migration.VirtualMachineImportStatus, orgErr error) (*migration.VirtualMachineImport, error) {
+	// check if any disks have been updated. We need to save this info to eventually reconcile the VMI creation
+	var newVM *migration.VirtualMachineImport
+	var newErr error
+	if !reflect.DeepEqual(orgStatus.DiskImportStatus, vm.Status.DiskImportStatus) {
+		newVM, newErr = h.importVM.UpdateStatus(vm)
+	}
+
+	if newErr != nil {
+		logrus.Errorf("error updating status for vm status %s: %v", vm.Name, newErr)
+	}
+	return newVM, fmt.Errorf("error updating virtalmachineimport status: %s/%s : %w, when original disk import failed %w", vm.Name, vm.Namespace, newErr, orgErr)
 }
