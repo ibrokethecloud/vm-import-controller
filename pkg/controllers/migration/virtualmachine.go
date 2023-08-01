@@ -10,8 +10,15 @@ import (
 	"strings"
 	"time"
 
+	coreControllers "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	"github.com/rancher/wrangler/pkg/relatedresource"
+	"github.com/sirupsen/logrus"
+	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 	kubevirt "kubevirt.io/api/core/v1"
 
@@ -26,13 +33,6 @@ import (
 	"github.com/harvester/vm-import-controller/pkg/source/openstack"
 	"github.com/harvester/vm-import-controller/pkg/source/vmware"
 	"github.com/harvester/vm-import-controller/pkg/util"
-	coreControllers "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
-	"github.com/rancher/wrangler/pkg/relatedresource"
-	"github.com/sirupsen/logrus"
-	v1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 )
 
 const (
@@ -92,111 +92,17 @@ func (h *virtualMachineHandler) OnVirtualMachineChange(key string, vmObj *migrat
 	vm := vmObj.DeepCopy()
 	switch vm.Status.Status {
 	case "": // run preflight checks and make vm ready for import
-		err := h.preFlightChecks(vm)
-		if err != nil {
-			if err.Error() == migration.NotValidDNS1123Label {
-				logrus.Errorf("vm migration target %s in VM %s in namespace %s is not RFC 1123 compliant", vm.Spec.VirtualMachineName, vm.Name, vm.Namespace)
-				vm.Status.Status = migration.VirtualMachineInvalid
-				h.importVM.UpdateStatus(vm)
-			} else {
-				return vm, err
-			}
-		}
-		vm.Status.Status = migration.SourceReady
-		return h.importVM.UpdateStatus(vm)
+		return h.preFlightWrapper(vm)
 	case migration.SourceReady: //vm migration is valid and ready. trigger migration specific import
-		err := h.triggerExport(vm)
-		if err != nil {
-			return vm, err
-		}
-		if util.ConditionExists(vm.Status.ImportConditions, migration.VirtualMachineExported, v1.ConditionTrue) {
-			vm.Status.Status = migration.DisksExported
-		}
-		return h.importVM.UpdateStatus(vm)
+		return h.triggerExportWrapper(vm)
 	case migration.DisksExported: // prepare and add routes for disks to be used for VirtualMachineImage CRD
-		orgStatus := vm.Status.DeepCopy()
-		// If VM has no disks associated ignore the VM
-		if len(orgStatus.DiskImportStatus) == 0 {
-			logrus.Errorf("Imported VM %s in namespace %s, has no disks, being marked as invalid and will be ignored", vm.Name, vm.Namespace)
-			vm.Status.Status = migration.VirtualMachineInvalid
-			return h.importVM.UpdateStatus(vm)
-
-		}
-
-		err := h.createVirtualMachineImages(vm)
-		if err != nil {
-			// check if any disks have been updated. We need to save this info to eventually reconcile the VMI creation
-			var newVM *migration.VirtualMachineImport
-			var newErr error
-			if !reflect.DeepEqual(orgStatus.DiskImportStatus, vm.Status.DiskImportStatus) {
-				newVM, newErr = h.importVM.UpdateStatus(vm)
-			}
-
-			if newErr != nil {
-				logrus.Errorf("error updating status for vm status %s: %v", vm.Name, newErr)
-			}
-			return newVM, err
-		}
-
-		ok := true
-		for _, d := range vm.Status.DiskImportStatus {
-			ok = util.ConditionExists(d.DiskConditions, migration.VirtualMachineImageSubmitted, v1.ConditionTrue) && ok
-		}
-
-		if ok {
-			vm.Status.Status = migration.DiskImagesSubmitted
-		}
-		return h.importVM.UpdateStatus(vm)
+		return h.createVirtualMachineImageWrapper(vm)
 	case migration.DiskImagesSubmitted:
-		// check and update disk image status based on VirtualMachineImage watches
-		err := h.reconcileVMIStatus(vm)
-		if err != nil {
-			return vm, err
-		}
-		ok := true
-		failed := false
-		var failedCount, passedCount int
-		for _, d := range vm.Status.DiskImportStatus {
-			ok = util.ConditionExists(d.DiskConditions, migration.VirtualMachineImageReady, v1.ConditionTrue) && ok
-			if ok {
-				passedCount++
-			}
-			failed = util.ConditionExists(d.DiskConditions, migration.VirtualMachineImageFailed, v1.ConditionTrue) || failed
-			if failed {
-				failedCount++
-			}
-		}
-
-		if len(vm.Status.DiskImportStatus) != failedCount+passedCount {
-			// if length's dont match, then we have disks with missing status. Lets ignore failures for now, and handle
-			// disk failures once we have had watches triggered for all disks
-			return vm, nil
-		}
-
-		if ok {
-			vm.Status.Status = migration.DiskImagesReady
-		}
-
-		if failed {
-			vm.Status.Status = migration.DiskImagesFailed
-		}
-		return h.importVM.UpdateStatus(vm)
+		return h.reconcileVirtualMachineImageWrapper(vm)
 	case migration.DiskImagesFailed:
-		// re-export VM and trigger re-import again
-		err := h.cleanupAndResubmit(vm)
-		if err != nil {
-			return vm, err
-		}
-		vm.Status.Status = migration.SourceReady
-		return h.importVM.UpdateStatus(vm)
+		return h.cleanupAndResubmitWrapper(vm)
 	case migration.DiskImagesReady:
-		// create VM to use the VirtualMachineObject
-		err := h.createVirtualMachine(vm)
-		if err != nil {
-			return vm, err
-		}
-		vm.Status.Status = migration.VirtualMachineCreated
-		return h.importVM.UpdateStatus(vm)
+		return h.createVirtualMachineWrapper(vm)
 	case migration.VirtualMachineCreated:
 		// wait for VM to be running using a watch on VM's
 		ok, err := h.checkVirtualMachine(vm)
@@ -701,4 +607,122 @@ func (h *virtualMachineHandler) checkAndCreateVirtualMachineImage(vm *migration.
 		},
 	}
 	return h.vmi.Create(vmi)
+}
+
+func (h *virtualMachineHandler) preFlightWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+	err := h.preFlightChecks(vm)
+	if err != nil {
+		if err.Error() == migration.NotValidDNS1123Label {
+			logrus.Errorf("vm migration target %s in VM %s in namespace %s is not RFC 1123 compliant", vm.Spec.VirtualMachineName, vm.Name, vm.Namespace)
+			vm.Status.Status = migration.VirtualMachineInvalid
+			h.importVM.UpdateStatus(vm)
+		} else {
+			return vm, err
+		}
+	}
+	vm.Status.Status = migration.SourceReady
+	return h.importVM.UpdateStatus(vm)
+}
+
+func (h *virtualMachineHandler) triggerExportWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+	err := h.triggerExport(vm)
+	if err != nil {
+		return vm, err
+	}
+	if util.ConditionExists(vm.Status.ImportConditions, migration.VirtualMachineExported, v1.ConditionTrue) {
+		vm.Status.Status = migration.DisksExported
+	}
+	return h.importVM.UpdateStatus(vm)
+}
+
+func (h *virtualMachineHandler) createVirtualMachineImageWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+	orgStatus := vm.Status.DeepCopy()
+	// If VM has no disks associated ignore the VM
+	if len(orgStatus.DiskImportStatus) == 0 {
+		logrus.Errorf("Imported VM %s in namespace %s, has no disks, being marked as invalid and will be ignored", vm.Name, vm.Namespace)
+		vm.Status.Status = migration.VirtualMachineInvalid
+		return h.importVM.UpdateStatus(vm)
+
+	}
+
+	err := h.createVirtualMachineImages(vm)
+	if err != nil {
+		// check if any disks have been updated. We need to save this info to eventually reconcile the VMI creation
+		var newVM *migration.VirtualMachineImport
+		var newErr error
+		if !reflect.DeepEqual(orgStatus.DiskImportStatus, vm.Status.DiskImportStatus) {
+			newVM, newErr = h.importVM.UpdateStatus(vm)
+		}
+
+		if newErr != nil {
+			logrus.Errorf("error updating status for vm status %s: %v", vm.Name, newErr)
+		}
+		return newVM, err
+	}
+
+	ok := true
+	for _, d := range vm.Status.DiskImportStatus {
+		ok = util.ConditionExists(d.DiskConditions, migration.VirtualMachineImageSubmitted, v1.ConditionTrue) && ok
+	}
+
+	if ok {
+		vm.Status.Status = migration.DiskImagesSubmitted
+	}
+	return h.importVM.UpdateStatus(vm)
+}
+
+func (h *virtualMachineHandler) reconcileVirtualMachineImageWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+	// check and update disk image status based on VirtualMachineImage watches
+	err := h.reconcileVMIStatus(vm)
+	if err != nil {
+		return vm, err
+	}
+	ok := true
+	failed := false
+	var failedCount, passedCount int
+	for _, d := range vm.Status.DiskImportStatus {
+		ok = util.ConditionExists(d.DiskConditions, migration.VirtualMachineImageReady, v1.ConditionTrue) && ok
+		if ok {
+			passedCount++
+		}
+		failed = util.ConditionExists(d.DiskConditions, migration.VirtualMachineImageFailed, v1.ConditionTrue) || failed
+		if failed {
+			failedCount++
+		}
+	}
+
+	if len(vm.Status.DiskImportStatus) != failedCount+passedCount {
+		// if length's dont match, then we have disks with missing status. Lets ignore failures for now, and handle
+		// disk failures once we have had watches triggered for all disks
+		return vm, nil
+	}
+
+	if ok {
+		vm.Status.Status = migration.DiskImagesReady
+	}
+
+	if failed {
+		vm.Status.Status = migration.DiskImagesFailed
+	}
+	return h.importVM.UpdateStatus(vm)
+}
+
+func (h *virtualMachineHandler) cleanupAndResubmitWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+	// re-export VM and trigger re-import again
+	err := h.cleanupAndResubmit(vm)
+	if err != nil {
+		return vm, err
+	}
+	vm.Status.Status = migration.SourceReady
+	return h.importVM.UpdateStatus(vm)
+}
+
+func (h *virtualMachineHandler) createVirtualMachineWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+	// create VM to use the VirtualMachineObject
+	err := h.createVirtualMachine(vm)
+	if err != nil {
+		return vm, err
+	}
+	vm.Status.Status = migration.VirtualMachineCreated
+	return h.importVM.UpdateStatus(vm)
 }
