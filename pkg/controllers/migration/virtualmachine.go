@@ -104,17 +104,7 @@ func (h *virtualMachineHandler) OnVirtualMachineChange(key string, vmObj *migrat
 	case migration.DiskImagesReady:
 		return h.createVirtualMachineWrapper(vm)
 	case migration.VirtualMachineCreated:
-		// wait for VM to be running using a watch on VM's
-		ok, err := h.checkVirtualMachine(vm)
-		if err != nil {
-			return vm, err
-		}
-		if ok {
-			vm.Status.Status = migration.VirtualMachineRunning
-			h.importVM.UpdateStatus(vm)
-		}
-		// by default we will poll again after 5 mins
-		h.importVM.EnqueueAfter(vm.Namespace, vm.Name, 5*time.Minute)
+		return h.checkVirtualMachineRunningWrapper(vm)
 	case migration.VirtualMachineRunning:
 		logrus.Infof("vm %s in namespace %v imported successfully", vm.Name, vm.Namespace)
 		return vm, h.tidyUpObjects(vm)
@@ -729,4 +719,19 @@ func (h *virtualMachineHandler) updateDiskImportStatus(vm *migration.VirtualMach
 		logrus.Errorf("error updating status for vm status %s: %v", vm.Name, newErr)
 	}
 	return newVM, fmt.Errorf("error updating virtalmachineimport status: %s/%s : %w, when original disk import failed %w", vm.Name, vm.Namespace, newErr, orgErr)
+}
+
+func (h *virtualMachineHandler) checkVirtualMachineRunningWrapper(vm *migration.VirtualMachineImport) (*migration.VirtualMachineImport, error) {
+	// wait for VM to be running using a watch on VM's
+	ok, err := h.checkVirtualMachine(vm)
+	if err != nil {
+		return vm, err
+	}
+
+	if !ok {
+		h.importVM.EnqueueAfter(vm.Namespace, vm.Name, 5*time.Minute)
+		return vm, nil
+	}
+	vm.Status.Status = migration.VirtualMachineRunning
+	return h.importVM.UpdateStatus(vm)
 }
