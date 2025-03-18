@@ -2,7 +2,6 @@ package migration
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,9 +22,8 @@ import (
 	harvester "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	ctlcniv1 "github.com/harvester/harvester/pkg/generated/controllers/k8s.cni.cncf.io/v1"
 	kubevirtv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
-	"github.com/harvester/harvester/pkg/ref"
-	coreControllers "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
-	"github.com/rancher/wrangler/pkg/relatedresource"
+	coreControllers "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
+	"github.com/rancher/wrangler/v3/pkg/relatedresource"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -36,7 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	kubevirt "kubevirt.io/api/core/v1"
 
-	storageControllers "github.com/rancher/wrangler/pkg/generated/controllers/storage/v1"
+	storageControllers "github.com/rancher/wrangler/v3/pkg/generated/controllers/storage/v1"
 )
 
 const (
@@ -672,22 +670,16 @@ func (h *virtualMachineHandler) findAndCreatePVC(vm *migration.VirtualMachineImp
 		}
 
 		if createPVC {
-			annotations, err := generateAnnotations(vm, vmiObj)
-			if err != nil {
-				return err
-			}
-
 			pvcObj := &v1.PersistentVolumeClaim{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        pvcName,
-					Namespace:   vm.Namespace,
-					Annotations: annotations,
+					Name:      pvcName,
+					Namespace: vm.Namespace,
 				},
 				Spec: v1.PersistentVolumeClaimSpec{
 					AccessModes: []v1.PersistentVolumeAccessMode{
 						v1.ReadWriteMany,
 					},
-					Resources: v1.ResourceRequirements{
+					Resources: v1.VolumeResourceRequirements{
 						Requests: v1.ResourceList{
 							v1.ResourceStorage: resource.MustParse(fmt.Sprintf("%d", vmiObj.Status.Size)),
 						},
@@ -738,26 +730,6 @@ func (h *virtualMachineHandler) tidyUpObjects(vm *migration.VirtualMachineImport
 		os.Remove(filepath.Join(server.TempDir(), v.Name))
 	}
 	return nil
-}
-
-// generateAnnotations will generate the harvester reference annotations: github.com/harvester/harvester/pkg/ref
-func generateAnnotations(vm *migration.VirtualMachineImport, vmi *harvesterv1beta1.VirtualMachineImage) (map[string]string, error) {
-	annotationSchemaOwners := ref.AnnotationSchemaOwners{}
-	_ = annotationSchemaOwners.Add(kubevirt.VirtualMachineGroupVersionKind.GroupKind(), vm)
-	var schemaID = ref.GroupKindToSchemaID(kubevirt.VirtualMachineGroupVersionKind.GroupKind())
-	var ownerRef = ref.Construct(vm.GetNamespace(), vm.Status.ImportedVirtualMachineName)
-	schemaRef := ref.AnnotationSchemaReference{SchemaID: schemaID, References: ref.NewAnnotationSchemaOwnerReferences()}
-	schemaRef.References.Insert(ownerRef)
-	annotationSchemaOwners[schemaID] = schemaRef
-	var ownersBytes, err = json.Marshal(annotationSchemaOwners)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal annotation schema owners: %w", err)
-	}
-	annotations := map[string]string{
-		ref.AnnotationSchemaOwnerKeyName: string(ownersBytes),
-		"harvesterhci.io/imageId":        fmt.Sprintf("%s/%s", vmi.Namespace, vmi.Name),
-	}
-	return annotations, nil
 }
 
 func (h *virtualMachineHandler) checkAndCreateVirtualMachineImage(vm *migration.VirtualMachineImport, d migration.DiskInfo) (*harvesterv1beta1.VirtualMachineImage, error) {
